@@ -1,335 +1,408 @@
 # -*- coding: utf-8 -*-
 """
-rt_plot_wdo_mm_fast.py  •  Windows + Python 3.12
-Plot RT (quase tempo real) do WDO com as bandas do MM.
+rt_plot_wdo_mm_fast.py
+Centro(t) = WDO@t0 + [mm_worst_bid(t) - mm_worst_bid@t0]
+Faixa(t)  = Centro(t) ± (best_ask(t) - best_bid(t)) / 2
+-> Nunca usa preço ABSOLUTO do MM no eixo Y. Só Δworst_bid e spread.
 
-Definições (NUNCA usar preço absoluto do MM):
-  t0           = 1º snapshot do MM do dia ("âncora")
-  WDO@t0       = preço do WDO no instante t0
-  centro(t)    = WDO@t0 + [worst_bid(t) - worst_bid@t0]
-  faixa(t)     = centro(t) ± (best_ask(t) - best_bid(t)) / 2
-
-Obs: lê do Access (pyodbc) em loop; roda sem Excel/coletor (offline) ou com coletor ligado (RT).
+Requisitos: Python 3.12, pandas 2.2, matplotlib 3.9, pyodbc 5.2
 """
 
-import os
 import pyodbc
-import numpy as np
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.patches import Rectangle
 from datetime import datetime, timedelta
-import time, warnings
+import warnings, time, logging
 
 # ================== CONFIG ==================
 DB = r"C:\Users\User\OneDrive\0 - Vida GOAT\10 Daytrade\Market Maker\MM_Analise.accdb"
 
-# Access schema
-TBL_WDO       = "wdo_trades"
-COL_WDO_TIME  = "hora_execucao"          # string 'HH:MM:SS.mmm'
-COL_WDO_PX    = "preco"
-
-TBL_MM        = "mm_snapshots"
-COL_MM_TIME   = "hora_captura"           # datetime
-COL_BEST_BID  = "mm_bid_price"
-COL_BEST_ASK  = "mm_ask_price"
-COL_WORST_BID = "mm_worst_bid_price"
-
-# Parâmetros de performance/visual
-BIN             = "5min"     # candles WDO
-REFRESH_SEC     = 3          # intervalo de atualização
-WINDOW_MIN      = 180        # janela visível (min). Ex.: 180 = 3h. Use None p/ tudo desde t0
-MM_RESAMPLE_SEC = 1          # reamostra MM para 1s p/ reduzir pontos (ffill)
-WDO_TOP_N       = 80000      # lê só as últimas N linhas (reduz I/O)
-READONLY_CONN   = True       # conexão ODBC somente leitura
-
-# Debug
-DEBUG_PRINTS     = False
-FORCE_SHIFT_ZERO = False     # True: centro = WDO@t0 (teste de fumaça)
-
-# ================== WARNINGS ==================
-warnings.filterwarnings(
-    "ignore",
-    message="pandas only supports SQLAlchemy connectable",
-    category=UserWarning
+# Tabelas/colunas
+TBL_MM  = "mm_snapshots"
+C_MM = dict(
+    id="id",
+    t="hora_captura",              # DATETIME (Access)
+    best_bid="mm_bid_price",
+    best_ask="mm_ask_price",
+    worst_bid="mm_worst_bid_price",
 )
 
+TBL_WDO = "wdo_trades"
+C_WDO = dict(
+    id="id",
+    mm_id="mm_snapshot_id",        # mapeia em qual snapshot foi colhido o trade
+    t="hora_execucao",             # TEXT 'HH:MM:SS.mmm'
+    px="preco",
+)
+
+# Plot/loop
+REFRESH_SEC   = 2                 # update a cada X segundos
+BIN           = "5min"            # candles WDO
+WINDOW_MIN    = 150               # janela rolante de X minutos no gráfico
+MAX_WB_JUMP   = 30.0              # filtro de pulos espúrios no worst_bid (pts)
+SPREAD_MIN    = 0.5               # sanity do spread
+SPREAD_MAX    = 50.0              # sanity do spread
+
+# ================== LOG & WARNINGS ==================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("rt_plot")
+
+# silencia o aviso do pandas sobre SQLAlchemy quando usamos pyodbc
+warnings.filterwarnings("ignore", message="pandas only supports SQLAlchemy connectable.*")
+
 # ================== HELPERS ==================
-def to_num(v):
-    """Converte string com vírgula/ponto em float. Retorna NaN para '', '-', None."""
-    if v is None: return np.nan
-    s = str(v).strip()
-    if s in ("", "-", "nan", "NaN", "None"): return np.nan
-    # normaliza separadores BR/US
-    if "." in s and "," in s:
-        s = s.replace(".", "").replace(",", ".")
-    elif "," in s:
-        s = s.replace(",", ".")
-    try:
-        return float(s)
-    except:
-        return np.nan
+def smart_to_float_series(s: pd.Series) -> pd.Series:
+    """Converte strings BR/US para float sem multiplicar por 10 acidentalmente."""
+    s = s.astype(str).str.strip()
+    s = s.replace({"": np.nan, "-": np.nan, "nan": np.nan, "NaN": np.nan})
+
+    has_comma  = s.str.contains(",", na=False)
+    has_dot    = s.str.contains(r"\.", na=False)
+
+    # caso '1.234,5' -> remove '.' de milhar e troca ',' por '.'
+    both = has_comma & has_dot
+    s.loc[both] = s.loc[both].str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+
+    # caso só vírgula '123,4' -> vira '123.4'
+    comma_only = has_comma & (~has_dot)
+    s.loc[comma_only] = s.loc[comma_only].str.replace(",", ".", regex=False)
+
+    # caso só ponto '1234.5' -> mantém
+    # outros: deixa como está
+    return pd.to_numeric(s, errors="coerce")
 
 def parse_hhmmssfff_to_ts(hhmm, session_date):
-    """Converte 'HH:MM:SS.mmm' (ou 'HH:MM:SS') em Timestamp do mesmo dia de session_date."""
+    """Combina HH:MM:SS(.fff) (texto) com a data da sessão (date) -> Timestamp."""
     if pd.isna(hhmm): return pd.NaT
     s = str(hhmm).strip().replace(",", ".")
     t = pd.to_datetime(s, format="%H:%M:%S.%f", errors="coerce")
     if pd.isna(t):
         t = pd.to_datetime(s, format="%H:%M:%S", errors="coerce")
-    if pd.isna(t):
-        return pd.NaT
+    if pd.isna(t): return pd.NaT
     return pd.to_datetime(f"{session_date} {t.strftime('%H:%M:%S.%f')}")
 
 def value_at_or_before(series: pd.Series, ts: pd.Timestamp):
-    """Último valor <= ts (pad). Retorna NaN se não existir."""
+    """Último valor <= ts (pandas pad)."""
     if series.empty: return np.nan
     idx = series.index.get_indexer([ts], method="pad")
     if idx[0] == -1: return np.nan
     return series.iloc[idx[0]]
 
-# ================== STATE ==================
-anchor_center = None   # WDO@t0
-anchor_t0     = None   # 1º snapshot MM do dia
-anchor_date   = None
+def sane_diff(series: pd.Series, max_jump: float) -> pd.Series:
+    """FFill pulos espúrios > max_jump entre amostras consecutivas."""
+    s = series.copy()
+    # marca jumps
+    diff = s.diff().abs()
+    mask_glitch = diff > max_jump
+    # substitui glitches por NaN -> ffill
+    s.loc[mask_glitch] = np.nan
+    return s.ffill()
 
-# ================== SETUP ==================
-conn_str = rf"DRIVER={{Microsoft Access Driver (*.mdb, *.accdb)}};DBQ={DB}"
-if READONLY_CONN:
-    conn_str += ";ReadOnly=1;"
-conn = pyodbc.connect(conn_str)
+# ================== STATE / CONN ==================
+conn = pyodbc.connect(r"DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};DBQ=" + DB)
 
+# caches incrementais
+mm_cache  = pd.DataFrame()
+wdo_cache = pd.DataFrame()
+last_mm_id  = None
+last_wdo_id = None
+
+anchor_t0     = None       # Timestamp do 1º snapshot MM do dia
+anchor_center = None       # WDO@t0
+anchor_date   = None       # date
+wb0_anchor    = None       # worst_bid@t0
+first_mm_id_today = None   # id do primeiro snapshot do dia
+
+# ================== PLOT SETUP ==================
 plt.ion()
 fig, ax = plt.subplots(figsize=(13, 7))
 
-def compute_and_draw():
-    global anchor_center, anchor_t0, anchor_date
+range_low_line,  = ax.step([], [], where="post", linewidth=1.8, label="Range Low (WDO@t0 + ΔWB − spread/2)")
+range_high_line, = ax.step([], [], where="post", linewidth=1.8, label="Range High (WDO@t0 + ΔWB + spread/2)")
+center_line,     = ax.step([], [], where="post", linestyle="--", linewidth=1.4, label="Centro (WDO@t0 + Δ worst bid)")
 
-    # ---------- 1) Descobre a data de sessão pelo último snapshot ----------
-    row = pd.read_sql(f"SELECT MAX({COL_MM_TIME}) as mx FROM {TBL_MM}", conn)
-    if row.empty or pd.isna(row.loc[0, "mx"]):
-        ax.clear(); ax.text(0.5, 0.5, "Sem snapshots MM", ha="center", va="center", transform=ax.transAxes)
-        plt.pause(0.5); return
+ann_text = ax.text(0.995, 0.98, "", ha="right", va="top", transform=ax.transAxes, fontsize=10,
+                   bbox=dict(boxstyle="round,pad=0.4", alpha=0.15))
 
-    last_ts = pd.to_datetime(row.loc[0, "mx"])
-    session_date = last_ts.normalize().date()
-    day_start = pd.Timestamp(session_date)
-    day_end   = day_start + pd.Timedelta(days=1)
+ax.legend(loc="upper left")
+ax.grid(True, alpha=0.25)
+ax.set_title("Tempo real • WDO 5m + Range do MM\nCentro = WDO@t0 + ΔWorstBid • Largura = BestAsk − BestBid (metade p/ lado)")
+ax.set_xlabel("Tempo"); ax.set_ylabel("Preço")
+ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=5))
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+fig.autofmt_xdate()
 
-    # ---------- 2) MM do dia (filtrado no SQL) ----------
-    mm = pd.read_sql(
-        f"""
-        SELECT {COL_MM_TIME},{COL_BEST_BID},{COL_BEST_ASK},{COL_WORST_BID}
-        FROM {TBL_MM}
-        WHERE {COL_MM_TIME} >= ? AND {COL_MM_TIME} < ?
-        ORDER BY {COL_MM_TIME}
-        """,
-        conn, params=[day_start, day_end]
-    )
-    if mm.empty:
-        ax.clear(); ax.text(0.5, 0.5, "Sem snapshots MM do dia", ha="center", va="center", transform=ax.transAxes)
-        plt.pause(0.5); return
+# para desenhar candles
+def draw_candles(ax, ohlc: pd.DataFrame):
+    """Desenha candles (wicks + corpo) do DataFrame OHLC indexado por ts."""
+    # limpa candles anteriores (apenas candles; mantém linhas)
+    for artist in list(ax.patches):
+        if isinstance(artist, Rectangle): artist.remove()
 
-    mm[COL_MM_TIME] = pd.to_datetime(mm[COL_MM_TIME], errors="coerce")
-    for c in (COL_BEST_BID, COL_BEST_ASK, COL_WORST_BID):
-        mm[c] = mm[c].apply(to_num)
-    mm = mm.dropna(subset=[COL_MM_TIME]).set_index(COL_MM_TIME).sort_index()
+    if ohlc.empty: return
+    idx = ohlc.index
+    # largura ~70% do passo
+    if len(idx) > 1:
+        step = (idx[1] - idx[0]).total_seconds()
+    else:
+        step = 300.0
+    width_days = (step/(24*3600)) * 0.7
 
-    # resample p/ reduzir densidade (1s)
-    if MM_RESAMPLE_SEC and MM_RESAMPLE_SEC > 0:
-        mm = mm.resample(f"{MM_RESAMPLE_SEC}s").last().ffill()
+    for t, row in ohlc.iterrows():
+        o,h,l,c = row["open"],row["high"],row["low"],row["close"]
+        if not np.isfinite(o+h+l+c) or min(o,h,l,c) <= 0: 
+            continue
+        x = mdates.date2num(pd.to_datetime(t).to_pydatetime())
+        # wick
+        ax.vlines(x, l, h, linewidth=1, color="0.35")
+        # body
+        y0, y1 = sorted([o, c])
+        ax.add_patch(Rectangle((x - width_days/2.0, y0),
+                               width_days, max(y1-y0, 1e-6),
+                               fill=True, color=(0.55,0.65,0.85,0.55), linewidth=0))
 
-    # t0 e reset de âncora se mudou de data
-    if (anchor_t0 is None) or (anchor_date != session_date):
-        anchor_t0 = mm.index[0]
-        anchor_date = session_date
-        anchor_center = None
+def initial_load_today():
+    """Carrega dados do dia (MM e WDO) e define âncora t0 e WDO@t0."""
+    global mm_cache, wdo_cache, last_mm_id, last_wdo_id
+    global anchor_t0, anchor_center, anchor_date, wb0_anchor, first_mm_id_today
 
-    # ---------- 3) WDO do dia (TOP N mais recentes, depois reordena crescente) ----------
-    wdo = pd.read_sql(
-        f"""
-        SELECT TOP {WDO_TOP_N} {COL_WDO_TIME},{COL_WDO_PX}
-        FROM {TBL_WDO}
-        ORDER BY {COL_WDO_TIME} DESC
-        """,
+    # 1) MM do dia
+    mm_all = pd.read_sql(
+        f"SELECT {C_MM['id']},{C_MM['t']},{C_MM['best_bid']},{C_MM['best_ask']},{C_MM['worst_bid']} "
+        f"FROM {TBL_MM} ORDER BY {C_MM['t']}",
         conn
     )
-    if not wdo.empty:
-        wdo = wdo.iloc[::-1].copy()  # ordem crescente
-        wdo["ts"] = wdo[COL_WDO_TIME].apply(lambda s: parse_hhmmssfff_to_ts(s, session_date))
-        wdo[COL_WDO_PX] = wdo[COL_WDO_PX].apply(to_num)
-        wdo = wdo.dropna(subset=["ts", COL_WDO_PX]).sort_values("ts")
+    mm_all[C_MM['t']] = pd.to_datetime(mm_all[C_MM['t']], errors="coerce")
+    mm_all = mm_all.dropna(subset=[C_MM['t']]).sort_values(C_MM['t'])
+    if mm_all.empty:
+        raise RuntimeError("Sem snapshots MM no banco.")
+
+    # usa a data do último snapshot como 'sessão'
+    session_date = mm_all[C_MM['t']].iloc[-1].normalize().date()
+
+    day_start = pd.Timestamp.combine(session_date, datetime.min.time())
+    day_end   = day_start + timedelta(days=1)
+
+    mm_today = mm_all[(mm_all[C_MM['t']] >= day_start) & (mm_all[C_MM['t']] < day_end)]
+    if mm_today.empty:
+        raise RuntimeError("Sem snapshots MM do DIA.")
+
+    # define t0 e id inicial do dia
+    anchor_t0 = pd.to_datetime(mm_today[C_MM['t']].iloc[0])
+    anchor_date = session_date
+    first_mm_id_today = int(mm_today[C_MM['id']].iloc[0])
+
+    # converte numéricos
+    for c in (C_MM['best_bid'], C_MM['best_ask'], C_MM['worst_bid']):
+        mm_today[c] = smart_to_float_series(mm_today[c])
+
+    mm_today = mm_today.set_index(C_MM['t']).sort_index()
+    mm_cache = mm_today.copy()
+    last_mm_id = int(mm_today[C_MM['id']].iloc[-1])
+
+    # 2) WDO do dia (usa mm_snapshot_id >= primeiro MM do dia)
+    wdo = pd.read_sql(
+        f"SELECT {C_WDO['id']},{C_WDO['mm_id']},{C_WDO['t']},{C_WDO['px']} "
+        f"FROM {TBL_WDO} "
+        f"WHERE {C_WDO['mm_id']} >= ? "
+        f"ORDER BY {C_WDO['id']}",
+        conn, params=[first_mm_id_today]
+    )
+    if wdo.empty:
+        raise RuntimeError("Sem trades WDO ligados ao MM de hoje.")
+
+    wdo[C_WDO['px']] = smart_to_float_series(wdo[C_WDO['px']])
+    wdo["ts"] = wdo[C_WDO['t']].apply(lambda s: parse_hhmmssfff_to_ts(s, session_date))
+    wdo = wdo.dropna(subset=["ts", C_WDO['px']]).sort_values("ts")
+    wdo_cache = wdo.copy()
+    last_wdo_id = int(wdo[C_WDO['id']].iloc[-1])
+
+    # 3) Âncora WDO@t0
+    before = wdo[wdo["ts"] <= anchor_t0]
+    after  = wdo[wdo["ts"] >= anchor_t0]
+    if not before.empty:
+        anchor_center_val = float(before.iloc[-1][C_WDO['px']])
+    elif not after.empty:
+        anchor_center_val = float(after.iloc[0][C_WDO['px']])
     else:
-        wdo = pd.DataFrame(columns=["ts", COL_WDO_PX])
+        raise RuntimeError("Não achei trade do WDO para ancorar o centro.")
+    # salva
+    anchor_center = anchor_center_val
 
-    # Define WDO@t0 (âncora do centro)
-    if anchor_center is None:
-        w0 = wdo[wdo["ts"] <= anchor_t0]
-        if w0.empty:
-            w0 = wdo[wdo["ts"] >= anchor_t0]
-        if w0.empty:
-            ax.clear(); ax.text(0.5, 0.5, "Aguardando WDO para ancorar o centro...", ha="center", va="center", transform=ax.transAxes)
-            plt.pause(0.5); return
-        anchor_center = float(w0.iloc[-1][COL_WDO_PX])
-        if DEBUG_PRINTS:
-            print(f"[ÂNCORA] t0={anchor_t0} | WDO@t0={anchor_center:.2f}")
-
-    # ---------- 4) Cálculo centro & banda ----------
-    wb = mm[COL_WORST_BID].astype(float).copy()
-    wb[(wb <= 0) | (~np.isfinite(wb))] = np.nan
-    wb = wb.ffill()
+    # 4) wb@t0
+    wb = mm_today[C_MM['worst_bid']].copy()
+    wb = wb.where((wb>0) & np.isfinite(wb)).ffill()
     wb0 = value_at_or_before(wb, anchor_t0)
-    if np.isnan(wb0):
+    if not np.isfinite(wb0):
         wb0 = wb.dropna().iloc[0] if wb.dropna().size else np.nan
+    wb0_anchor = float(wb0) if np.isfinite(wb0) else np.nan
 
-    if FORCE_SHIFT_ZERO:
-        shift = pd.Series(0.0, index=wb.index)
-    else:
-        shift = (wb - wb0).fillna(0.0)
+    log.info("Âncora definida | t0=%s | WDO@t0=%.2f | wb@t0=%.2f | MM rows=%d | WDO rows=%d",
+             anchor_t0.strftime("%H:%M:%S"), anchor_center, wb0_anchor, len(mm_cache), len(wdo_cache))
 
-    center = anchor_center + shift
-    # garante a âncora exata
-    center.loc[anchor_t0] = anchor_center
-    center = center.sort_index()
+def fetch_incremental():
+    """Busca apenas novos registros de MM e WDO."""
+    global mm_cache, wdo_cache, last_mm_id, last_wdo_id
 
-    bb = mm[COL_BEST_BID].astype(float)
-    ba = mm[COL_BEST_ASK].astype(float)
-    spread = (ba - bb).where((ba > 0) & (bb > 0))
-    spread = spread.where(spread > 0).ffill()
-    half = spread / 2.0
+    # MM novos
+    mm_new = pd.read_sql(
+        f"SELECT {C_MM['id']},{C_MM['t']},{C_MM['best_bid']},{C_MM['best_ask']},{C_MM['worst_bid']} "
+        f"FROM {TBL_MM} WHERE {C_MM['id']} > ? ORDER BY {C_MM['id']}",
+        conn, params=[last_mm_id]
+    )
+    if not mm_new.empty:
+        mm_new[C_MM['t']] = pd.to_datetime(mm_new[C_MM['t']], errors="coerce")
+        for c in (C_MM['best_bid'], C_MM['best_ask'], C_MM['worst_bid']):
+            mm_new[c] = smart_to_float_series(mm_new[c])
+        mm_new = mm_new.dropna(subset=[C_MM['t']]).set_index(C_MM['t']).sort_index()
+        mm_cache = pd.concat([mm_cache, mm_new])
+        # drop duplicadas por índice de tempo (mantém última)
+        mm_cache = mm_cache[~mm_cache.index.duplicated(keep="last")]
+        last_mm_id = int(mm_cache[C_MM['id']].max())
 
+    # WDO novos
+    wdo_new = pd.read_sql(
+        f"SELECT {C_WDO['id']},{C_WDO['mm_id']},{C_WDO['t']},{C_WDO['px']} "
+        f"FROM {TBL_WDO} WHERE {C_WDO['id']} > ? ORDER BY {C_WDO['id']}",
+        conn, params=[last_wdo_id]
+    )
+    if not wdo_new.empty:
+        wdo_new[C_WDO['px']] = smart_to_float_series(wdo_new[C_WDO['px']])
+        wdo_new["ts"] = wdo_new[C_WDO['t']].apply(lambda s: parse_hhmmssfff_to_ts(s, anchor_date))
+        wdo_new = wdo_new.dropna(subset=["ts", C_WDO['px']]).sort_values("ts")
+        wdo_cache = pd.concat([wdo_cache, wdo_new], ignore_index=True)
+        last_wdo_id = int(wdo_cache[C_WDO['id']].max())
+
+def compute_and_draw():
+    """Recalcula linhas e redesenha dentro da janela rolante."""
+    # 1) monta séries do MM (indexadas em tempo)
+    mm = mm_cache.copy()
+    if mm.empty: return
+
+    # saneia worst_bid (Δ) e spread
+    wb = mm[C_MM['worst_bid']].where((mm[C_MM['worst_bid']] > 0) & np.isfinite(mm[C_MM['worst_bid']])).ffill()
+    wb = sane_diff(wb, MAX_WB_JUMP)
+
+    bb = mm[C_MM['best_bid']].astype(float)
+    ba = mm[C_MM['best_ask']].astype(float)
+    spread = (ba - bb).where((ba > 0) & (bb > 0)).where(lambda x: (x >= SPREAD_MIN) & (x <= SPREAD_MAX)).ffill()
+
+    # anchor wb0
+    wb0 = value_at_or_before(wb, anchor_t0)
+    if not np.isfinite(wb0): wb0 = wb.dropna().iloc[0] if wb.dropna().size else np.nan
+
+    # centro = WDO@t0 + (wb - wb0)
+    center = pd.Series(anchor_center, index=wb.index) + (wb - wb0).fillna(0.0)
+
+    # low/high
+    half = (spread/2.0).fillna(method="ffill")
     low  = center - half
     high = center + half
 
-    # ---------- 5) Candles WDO (5min) ----------
-    wplot = pd.DataFrame()
-    if not wdo.empty:
-        wdo5 = wdo.set_index("ts")[COL_WDO_PX].resample(BIN).ohlc().dropna(how="any")
-        wplot = wdo5
-
-    # ---------- 6) Janela temporal ----------
-    if WINDOW_MIN is not None:
-        tmax = max(center.index.max(), wplot.index.max()) if len(wplot) else center.index.max()
-        tmin = max(anchor_t0, tmax - pd.Timedelta(minutes=WINDOW_MIN))
+    # 2) candles WDO 5m
+    wdo = wdo_cache.copy()
+    if wdo.empty:
+        wdo5 = pd.DataFrame(columns=list("ohlc"))
     else:
-        tmin = anchor_t0
-        tmax = max(center.index.max(), wplot.index.max()) if len(wplot) else center.index.max()
+        wdo5 = wdo.set_index("ts")[C_WDO['px']].resample(BIN).ohlc().dropna(how="any")
+
+    # 3) janela rolante
+    tmax_mm = center.index.max()
+    tmax_w  = wdo5.index.max() if len(wdo5) else tmax_mm
+    tmax    = max(tmax_mm, tmax_w)
+    tmin    = tmax - pd.Timedelta(minutes=WINDOW_MIN)
 
     # recortes
-    msel = (center.index >= tmin) & (center.index <= tmax)
-    if len(wplot):
-        wplot = wplot[(wplot.index >= tmin) & (wplot.index <= tmax)]
+    msel  = (center.index >= tmin) & (center.index <= tmax)
+    wsel  = wdo5.index[(wdo5.index >= tmin) & (wdo5.index <= tmax)]
 
-    # ---------- 7) Plot ----------
-    ax.clear()
-
-    # candles WDO
-    if len(wplot):
-        step = (wplot.index[1] - wplot.index[0]).total_seconds() if len(wplot) > 1 else 300.0
-        width_days = (step / (24 * 3600)) * 0.7
-        for t, row in wplot.iterrows():
-            o, h, l, c = row["open"], row["high"], row["low"], row["close"]
-            if not np.isfinite(o + h + l + c) or min(o, h, l, c) <= 0:
-                continue
-            x = mdates.date2num(pd.to_datetime(t).to_pydatetime())
-            ax.vlines(x, l, h, linewidth=1, color="0.4")
-            y0, y1 = sorted([o, c])
-            ax.add_patch(Rectangle((x - width_days / 2.0, y0),
-                                   width_days, max(y1 - y0, 1e-6),
-                                   fill=True, color=(0.6, 0.6, 0.6, 0.35), linewidth=0))
-
-    # linhas do range/centro (timestamps do MM)
+    # 4) desenha (sem ax.clear)
+    # linhas
     if msel.any():
         cx = mdates.date2num(center.index[msel].to_pydatetime())
-        ax.step(cx, low[msel].values,  where="post", linewidth=1.8, label="Range Low (âncora + ΔWB − spread/2)")
-        ax.step(cx, high[msel].values, where="post", linewidth=1.8, label="Range High (âncora + ΔWB + spread/2)")
-        ax.step(cx, center[msel].values, where="post", linestyle="--", linewidth=1.4, label="Centro (âncora + ΔWB)")
+        range_low_line.set_data(cx,  low[msel].values)
+        range_high_line.set_data(cx, high[msel].values)
+        center_line.set_data(cx,     center[msel].values)
+    else:
+        range_low_line.set_data([], [])
+        range_high_line.set_data([], [])
+        center_line.set_data([], [])
 
-    # métrica rápida
+    # candles
+    draw_candles(ax, wdo5.loc[wsel] if len(wsel) else pd.DataFrame())
+
+    # métricas
     last_center = float(center[msel].iloc[-1]) if msel.any() else np.nan
     last_half   = float(half[msel].iloc[-1]) if msel.any() else np.nan
-    last_close  = float(wplot["close"].iloc[-1]) if len(wplot) else np.nan
+    last_close  = float(wdo5.loc[wsel]["close"].iloc[-1]) if len(wsel) else np.nan
     dist        = last_close - last_center if np.isfinite(last_close) and np.isfinite(last_center) else np.nan
 
-    # % candles dentro do range (usando bordas do tempo mais próximo)
+    # % candles dentro do range
     pct_inside = np.nan
-    if len(wplot) and msel.any():
-        lows, highs = [], []
-        for t, _ in wplot.iterrows():
-            ilow  = low[low.index <= t]
-            ihigh = high[high.index <= t]
-            lows.append(ilow.iloc[-1] if len(ilow) else np.nan)
-            highs.append(ihigh.iloc[-1] if len(ihigh) else np.nan)
-        rng_low  = pd.Series(lows,  index=wplot.index)
-        rng_high = pd.Series(highs, index=wplot.index)
-        inside = (wplot["high"] <= rng_high) & (wplot["low"] >= rng_low)
+    if len(wsel) and msel.any():
+        rng_low  = low.reindex(wdo5.index, method="ffill")
+        rng_high = high.reindex(wdo5.index, method="ffill")
+        wv = wdo5.loc[wsel]
+        inside = (wv["high"] <= rng_high.loc[wsel]) & (wv["low"] >= rng_low.loc[wsel])
         if inside.size:
             pct_inside = 100.0 * inside.sum() / inside.size
 
-    ax.text(0.995, 0.98,
-            "\n".join([
-                f"WDO@t0 (âncora): {anchor_center:.1f}",
-                f"Centro atual: {last_center:.1f}" if np.isfinite(last_center) else "Centro atual: n/a",
-                f"Spread/2 atual: {last_half:.1f}" if np.isfinite(last_half) else "Spread/2 atual: n/a",
-                f"Dist. WDO→centro: {dist:+.1f}" if np.isfinite(dist) else "Dist. WDO→centro: n/a",
-                f"% candles dentro: {pct_inside:.1f}%" if np.isfinite(pct_inside) else "% candles dentro: n/a",
-            ]),
-            ha="right", va="top", transform=ax.transAxes, fontsize=10,
-            bbox=dict(boxstyle="round,pad=0.4", alpha=0.15))
+    # anotações
+    ann_text.set_text("\n".join([
+        f"Data sessão: {anchor_date}",
+        f"WDO@t0 (âncora): {anchor_center:.1f}",
+        f"Centro atual: {last_center:.1f}" if np.isfinite(last_center) else "Centro atual: n/a",
+        f"Spread/2 atual: {last_half:.1f}" if np.isfinite(last_half) else "Spread/2 atual: n/a",
+        f"Dist. WDO→centro: {dist:+.1f}" if np.isfinite(dist) else "Dist. WDO→centro: n/a",
+        f"% candles dentro: {pct_inside:.1f}%" if np.isfinite(pct_inside) else "% candles dentro: n/a",
+    ]))
 
-    # marca t0 (âncora)
-    ax.axvline(mdates.date2num(pd.to_datetime(anchor_t0).to_pydatetime()),
-               linestyle="--", linewidth=1, alpha=0.6, color="0.4")
-    ax.text(mdates.date2num(pd.to_datetime(anchor_t0).to_pydatetime()),
-            anchor_center, "  t0/MM (âncora=WDO)", va="bottom", fontsize=8, alpha=0.7, color="0.4")
-
-    # eixos
-    ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=5))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-    fig.autofmt_xdate()
-    ax.set_title("WDO 5min + Range do MM • Centro = âncora(WDO@t0) + Δworst_bid • Largura = (best_ask−best_bid)/2")
-    ax.set_xlabel("Tempo"); ax.set_ylabel("Preço")
-    # legenda é custosa em cada redraw; comente se precisar de mais fps
-    ax.legend(loc="upper left")
-    ax.grid(True, alpha=0.25)
-
-    # zoom Y robusto
+    # faixa x/y
+    ax.set_xlim(mdates.date2num(tmin.to_pydatetime()), mdates.date2num(tmax.to_pydatetime()))
+    # Y robusto
     yvals = []
-    if len(wplot):
-        yvals += list(wplot[["open", "high", "low", "close"]].values.flatten())
+    if len(wsel):
+        yvals += list(wdo5.loc[wsel][["open","high","low","close"]].values.ravel())
     if msel.any():
         yvals += list(low[msel].values) + list(high[msel].values)
-    yvals = np.array([v for v in yvals if np.isfinite(v) and v > 0])
+    yvals = np.array([v for v in yvals if np.isfinite(v) and v>0])
     if yvals.size:
-        lo, hi = np.quantile(yvals, [0.02, 0.98]); pad = (hi - lo) * 0.12 if hi > lo else 10
-        ax.set_ylim(lo - pad, hi + pad)
+        lo, hi = np.quantile(yvals, [0.02, 0.98])
+        pad = (hi-lo)*0.12 if hi>lo else 10
+        ax.set_ylim(lo-pad, hi+pad)
 
-    # deixa o GUI respirar (Windows)
-    plt.pause(0.001)
+    # marca t0
+    ax.lines = [l for l in ax.lines]  # garante que step-lines permaneçam
+    ax.axvline(mdates.date2num(anchor_t0.to_pydatetime()), linestyle="--", linewidth=1, alpha=0.35, color="0.4")
+    ax.text(mdates.date2num(anchor_t0.to_pydatetime()), anchor_center, "  t0/MM (âncora=WDO)",
+            va="bottom", fontsize=8, alpha=0.6, color="0.35")
 
-    if DEBUG_PRINTS and msel.any():
-        wb_now = wb.dropna().iloc[-1] if len(wb.dropna()) else np.nan
-        cur_shift = float(center[msel].iloc[-1] - anchor_center) if np.isfinite(last_center) else np.nan
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] "
-              f"t0={anchor_t0.time()} | WDO@t0={anchor_center:.2f} | "
-              f"wb@t0={wb0:.2f} | wb@now={wb_now:.2f} | "
-              f"shift={cur_shift:+.2f} | center={last_center:.2f} | half={last_half:.2f}")
+    fig.canvas.draw()
+    fig.canvas.flush_events()
 
-# ================== LOOP ==================
-try:
+def main():
+    initial_load_today()
     while True:
         try:
+            fetch_incremental()
             compute_and_draw()
+            time.sleep(REFRESH_SEC)
+        except KeyboardInterrupt:
+            print("⏹️ Encerrado pelo usuário.")
+            break
         except Exception as e:
-            # erro “soft” no ciclo: loga e segue
-            print("⚠️ loop error:", repr(e))
+            log.warning("Loop error: %r", e)
             time.sleep(1.0)
-        time.sleep(REFRESH_SEC)
-except KeyboardInterrupt:
-    print("⏹️ Encerrado pelo usuário.")
-finally:
+
+if __name__ == "__main__":
     try:
-        conn.close()
-    except:
-        pass
+        main()
+    finally:
+        try: conn.close()
+        except: pass
